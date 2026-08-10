@@ -1,14 +1,19 @@
-name: Monthly Strategy Rebalance Alert
+name: Strategy Daily Portfolio & PnL Report
 
 on:
   schedule:
-    # 每月 1 號 UTC 12:00 (台灣時間晚上 8:00，開盤前自動跑)
-    - cron: '0 12 1 * *'
-  workflow_dispatch: # 支援在 GitHub 隨時手動點按鈕觸發測試
+    # 每個美股交易日收盤後自動推送 (UTC 21:00 = 台灣時間清晨 5:00/夏令 4:00)
+    - cron: '0 21 * * 1-5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   run-strategy:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: 檢出程式碼
         uses: actions/checkout@v4
@@ -19,7 +24,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝套件
-        run: pip install alpaca-py yfinance pandas numpy requests
+        run: pip install alpaca-py yfinance pandas numpy requests matplotlib
 
       - name: 執行策略計算並發送 Telegram
         env:
