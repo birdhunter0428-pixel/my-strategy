@@ -19,7 +19,7 @@ jobs:
           python-version: '3.11'
 
       - name: 安裝套件
-        run: pip install alpaca-py pandas numpy requests
+        run: pip install alpaca-py yfinance pandas numpy requests
 
       - name: 執行策略計算並發送 Telegram
         env:
