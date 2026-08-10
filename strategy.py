@@ -8,6 +8,7 @@ import requests
 from alpaca.data.historical import StockHistoricalDataClient
 from alpaca.data.requests import StockBarsRequest
 from alpaca.data.timeframe import TimeFrame
+from alpaca.data.enums import DataFeed
 
 # 1. 資產池定義
 TECH_POOL = ["FNGS", "QQQ", "IYW", "SMH", "TSM", "STX", "NVDA", "SOXX", "XLK", "VUG", "IWF", "PLTR", "WDC"]
@@ -15,23 +16,31 @@ DEF_POOL  = ["BIL", "SHY", "IEF", "GLD", "TLT", "XLV", "VDE"]
 ALL_TICKERS = list(set(TECH_POOL + DEF_POOL))
 
 def fetch_data():
-    api_key = os.environ.get("ALPACA_API_KEY")
-    secret_key = os.environ.get("ALPACA_SECRET_KEY")
+    api_key = os.environ.get("ALPACA_API_KEY", "").strip()
+    secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
-    if not api_key or not secret_key:
-        raise ValueError("❌ 找不到 ALPACA 金鑰，請檢查 GitHub Secrets。")
-        
-    client = StockHistoricalDataClient(api_key, secret_key)
-    start_date = datetime.now() - timedelta(days=500)
-    request_params = StockBarsRequest(
-        symbol_or_symbols=ALL_TICKERS,
-        timeframe=TimeFrame.Day,
-        start=start_date
-    )
-    
-    bars = client.get_stock_bars(request_params)
-    close_df = bars.df["close"].unstack(level=0).dropna(how="all")
-    return close_df
+    if api_key and secret_key:
+        try:
+            print("正在透過 Alpaca 官方 API (IEX 數據源) 抓取價格...")
+            client = StockHistoricalDataClient(api_key, secret_key)
+            start_date = datetime.now() - timedelta(days=500)
+            request_params = StockBarsRequest(
+                symbol_or_symbols=ALL_TICKERS,
+                timeframe=TimeFrame.Day,
+                start=start_date,
+                feed=DataFeed.IEX  # 專門支援 Alpaca 免費/模擬帳號數據源
+            )
+            bars = client.get_stock_bars(request_params)
+            close_df = bars.df["close"].unstack(level=0).dropna(how="all")
+            if not close_df.empty:
+                return close_df
+        except Exception as e:
+            print(f"⚠️ Alpaca API 抓取失敗: {e}\n正在自動切換至備用數據源...")
+            
+    print("正在透過備用數據源抓取價格...")
+    import yfinance as yf
+    df = yf.download(ALL_TICKERS, period="2y", progress=False)["Close"].dropna(how="all")
+    return df
 
 def get_market_regime(df):
     qqq = df["QQQ"].dropna()
@@ -176,10 +185,14 @@ def run_strategy():
     send_telegram("\n".join(msg))
 
 def send_telegram(text):
-    token = os.environ.get("TELEGRAM_BOT_TOKEN")
-    chat_id = os.environ.get("TELEGRAM_CHAT_ID")
+    token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
+    chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     if token and chat_id:
-        requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        if res.status_code != 200:
+            print(f"❌ Telegram 發送失敗: {res.text}")
+        else:
+            print("✅ Telegram 訊息已成功發送！")
 
 if __name__ == "__main__":
     run_strategy()
