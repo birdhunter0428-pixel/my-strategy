@@ -24,24 +24,26 @@ def fetch_data():
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
     if HAS_ALPACA and api_key and secret_key:
-        try:
-            print("正在透過 Alpaca 官方 API (IEX 數據源) 抓取價格...")
-            client = StockHistoricalDataClient(api_key, secret_key)
-            start_date = datetime.now() - timedelta(days=500)
-            request_params = StockBarsRequest(
-                symbol_or_symbols=ALL_TICKERS,
-                timeframe=TimeFrame.Day,
-                start=start_date,
-                feed=DataFeed.IEX
-            )
-            bars = client.get_stock_bars(request_params)
-            close_df = bars.df["close"].unstack(level=0).dropna(how="all")
-            if not close_df.empty:
-                return close_df
-        except Exception as e:
-            print(f"⚠️ Alpaca API 抓取失敗: {e}\n正在自動切換至 yfinance 數據源...")
+        for is_sandbox in [False, True]:
+            try:
+                print(f"正在透過 Alpaca 官方 API (sandbox={is_sandbox}) 抓取價格...")
+                client = StockHistoricalDataClient(api_key, secret_key, sandbox=is_sandbox)
+                start_date = datetime.now() - timedelta(days=500)
+                request_params = StockBarsRequest(
+                    symbol_or_symbols=ALL_TICKERS,
+                    timeframe=TimeFrame.Day,
+                    start=start_date,
+                    feed=DataFeed.IEX
+                )
+                bars = client.get_stock_bars(request_params)
+                close_df = bars.df["close"].unstack(level=0).dropna(how="all")
+                if not close_df.empty:
+                    print("✅ Alpaca 官方數據抓取成功！")
+                    return close_df
+            except Exception as e:
+                print(f"⚠️ Alpaca API 嘗試: {e}")
             
-    print("正在透過 yfinance 數據源抓取價格...")
+    print("正在透過備用數據源抓取價格...")
     import yfinance as yf
     df = yf.download(ALL_TICKERS, period="2y", progress=False)["Close"].dropna(how="all")
     return df
