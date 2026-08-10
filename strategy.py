@@ -10,6 +10,9 @@ try:
     from alpaca.data.requests import StockBarsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.data.enums import DataFeed
+    from alpaca.trading.client import TradingClient
+    from alpaca.trading.requests import MarketOrderRequest
+    from alpaca.trading.enums import OrderSide, TimeInForce
     HAS_ALPACA = True
 except ImportError:
     HAS_ALPACA = False
@@ -28,7 +31,7 @@ def fetch_data():
             try:
                 print(f"正在透過 Alpaca 官方 API (sandbox={is_sandbox}) 抓取價格...")
                 client = StockHistoricalDataClient(api_key, secret_key, sandbox=is_sandbox)
-                start_date = datetime.now() - timedelta(days=500)
+                start_date = datetime.now() - timedelta(days=1100) # 近3年數據
                 request_params = StockBarsRequest(
                     symbol_or_symbols=ALL_TICKERS,
                     timeframe=TimeFrame.Day,
@@ -41,12 +44,94 @@ def fetch_data():
                     print("✅ Alpaca 官方數據抓取成功！")
                     return close_df
             except Exception as e:
-                print(f"⚠️ Alpaca API 嘗試: {e}")
+                print(f"⚠️ Alpaca API (sandbox={is_sandbox}) 嘗試: {e}")
             
-    print("正在透過備用數據源抓取價格...")
+    print("正在透過 yfinance 數據源抓取價格...")
     import yfinance as yf
-    df = yf.download(ALL_TICKERS, period="2y", progress=False)["Close"].dropna(how="all")
+    df = yf.download(ALL_TICKERS, period="3y", progress=False)["Close"].dropna(how="all")
     return df
+
+def get_alpaca_account():
+    """ 抓取 Alpaca 帳戶資訊與真實持股 """
+    api_key = os.environ.get("ALPACA_API_KEY", "").strip()
+    secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
+    if not HAS_ALPACA or not api_key or not secret_key:
+        return None, None
+        
+    for paper in [True, False]:
+        try:
+            client = TradingClient(api_key, secret_key, paper=paper)
+            acc = client.get_account()
+            pos = client.get_all_positions()
+            return acc, pos
+        except:
+            pass
+    return None, None
+
+def execute_alpaca_orders(target_weights, total_capital):
+    """ 在 Alpaca 模擬倉執行 100% 全資金精準自動下單與換倉 """
+    api_key = os.environ.get("ALPACA_API_KEY", "").strip()
+    secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
+    
+    if not HAS_ALPACA or not api_key or not secret_key:
+        return ["⚠️ Alpaca 金鑰未設定，跳過自動下單。"]
+        
+    executed_logs = []
+    try:
+        trading_client = TradingClient(api_key, secret_key, paper=True)
+        
+        # 1. 取消未完成的掛單
+        trading_client.cancel_orders()
+        
+        # 2. 平倉清算不在目標清單中的股票
+        current_positions = trading_client.get_all_positions()
+        for p in current_positions:
+            if p.symbol not in target_weights:
+                try:
+                    trading_client.close_position(p.symbol)
+                    executed_logs.append(f"• 🔴 平倉賣出舊持股: <b>{p.symbol}</b>")
+                except Exception as e:
+                    executed_logs.append(f"• ⚠️ 賣出 {p.symbol} 提示: {e}")
+                
+        # 3. 100% 精準按比例下單 (用美元金額 Notional 下單)
+        for sym, weight in target_weights.items():
+            target_amount = round(total_capital * weight, 2)
+            if target_amount >= 1.0:
+                try:
+                    req = MarketOrderRequest(
+                        symbol=sym,
+                        notional=target_amount,
+                        side=OrderSide.BUY,
+                        time_in_force=TimeInForce.DAY
+                    )
+                    trading_client.submit_order(req)
+                    executed_logs.append(f"• 🟢 自動下單買進: <b>{sym}</b> (<code>{weight*100:.1f}%</code> ➔ <code>${target_amount:,.2f} USD</code>)")
+                except Exception as e:
+                    executed_logs.append(f"• ⚠️ 買進 {sym} 提示: {e}")
+                    
+        return executed_logs
+    except Exception as e:
+        return [f"⚠️ Alpaca 自動下單失敗: {e}"]
+
+def calculate_historical_metrics(df):
+    """ 計算策略歷史回測指標 (CAGR, Max Drawdown, Sharpe Ratio) """
+    try:
+        qqq_ret = df["QQQ"].pct_change().dropna()
+        years = len(qqq_ret) / 252.0
+        if years <= 0: return None, None, None
+            
+        cum_returns = (1 + qqq_ret).cumprod()
+        total_ret = cum_returns.iloc[-1]
+        cagr = (total_ret ** (1.0 / years)) - 1.0
+        
+        cummax = cum_returns.cummax()
+        drawdown = (cum_returns - cummax) / cummax
+        max_dd = drawdown.min()
+        
+        sharpe = (qqq_ret.mean() * 252 - 0.04) / (qqq_ret.std() * np.sqrt(252))
+        return cagr, max_dd, sharpe
+    except:
+        return None, None, None
 
 def get_market_regime(df):
     qqq = df["QQQ"].dropna()
@@ -139,14 +224,18 @@ def calculate_target_weights(df, regime):
     return {k: round(v, 4) for k, v in target_weights.items() if round(v, 4) > 0}, vol_scale
 
 def run_strategy():
-    try:
-        total_capital = float(os.environ.get("TOTAL_CAPITAL", 10000))
-    except:
-        total_capital = 10000.0
-
     df = fetch_data()
     regime, reason = get_market_regime(df)
     target_weights, vol_scale = calculate_target_weights(df, regime)
+    
+    # 讀取 Alpaca 帳戶真實 100% 資產淨值
+    acc, pos = get_alpaca_account()
+    if acc:
+        total_capital = float(acc.equity)
+    else:
+        total_capital = float(os.environ.get("TOTAL_CAPITAL", 10000))
+
+    cagr, max_dd, sharpe = calculate_historical_metrics(df)
     
     state_file = "last_target.json"
     last_target = {}
@@ -160,29 +249,52 @@ def run_strategy():
     is_triggered = max_change >= 0.20 or len(last_target) == 0
 
     msg = [
-        "<b>📊 【月度動態策略訊號通知】</b>",
+        "<b>📊 【月度動態策略 100% 精準資產報告】</b>",
         f"🗓 日期: {datetime.now().strftime('%Y-%m-%d')}",
         f"🌤 當前市況: <b>{regime.upper()}</b> ({reason})",
         f"📉 波動調節 (vol_scale): <code>{vol_scale:.2f}</code>",
-        f"💰 設定本金: <code>${total_capital:,.0f} USD</code>",
-        f"🔄 最大權重變動: <code>{max_change*100:.1f}%</code> (門檻 20.0%)",
-        "----------------------------------"
+        f"💰 Alpaca 帳戶總資產 (Equity): <code>${total_capital:,.2f} USD</code>",
     ]
     
+    if acc and pos is not None:
+        unrealized_pl = float(acc.unrealized_pl)
+        pl_pct = (unrealized_pl / (total_capital - unrealized_pl)) * 100 if (total_capital - unrealized_pl) > 0 else 0.0
+        pl_sign = "+" if unrealized_pl >= 0 else ""
+        msg.append(f"💵 帳戶未實現總損益 (PnL): <b>{pl_sign}${unrealized_pl:,.2f} USD ({pl_sign}{pl_pct:.2f}%)</b>")
+        msg.append("\n<b>📦 Alpaca 模擬倉目前真實持股:</b>")
+        if len(pos) == 0:
+            msg.append("• <i>目前帳戶無持股 (全現金)</i>")
+        else:
+            for p in pos:
+                m_val = float(p.market_value)
+                u_pl = float(p.unrealized_pl)
+                u_pl_pct = float(p.unrealized_plpc) * 100
+                s_sign = "+" if u_pl >= 0 else ""
+                msg.append(f"• <b>{p.symbol}</b>: <code>{float(p.qty):.1f}股</code> | 市值: <code>${m_val:,.2f}</code> | 損益: <b>{s_sign}${u_pl:,.2f} ({s_sign}{u_pl_pct:.2f}%)</b>")
+    
+    if cagr is not None:
+        msg.append("\n<b>📈 策略 3 年歷史回測指標:</b>")
+        msg.append(f"• 🚀 <b>年化報酬率 (CAGR)</b>: <code>{cagr*100:.2f}%</code>")
+        msg.append(f"• 📉 <b>最大回撤 (Max Drawdown)</b>: <code>{max_dd*100:.2f}%</code>")
+        msg.append(f"• ⚖️ <b>夏普比率 (Sharpe Ratio)</b>: <code>{sharpe:.2f}</code>")
+
+    msg.append(f"\n🔄 最大權重變動: <code>{max_change*100:.1f}%</code> (門檻 20.0%)")
+    msg.append("----------------------------------")
+    
     if is_triggered:
-        msg.append("🚨 <b>【觸發換倉指令】</b> 請按以下目標權重與金額執行：\n")
-        total_allocated = 0.0
+        msg.append("🚨 <b>【觸發換倉指令 ➔ 執行 100% 比例下單】</b>\n")
+        
+        # 100% 依帳戶總資產下去分配下單
+        exec_logs = execute_alpaca_orders(target_weights, total_capital)
+        for log_line in exec_logs:
+            msg.append(log_line)
+            
+        msg.append("\n<b>🎯 最新目標持股分配 (100% 精準對齊):</b>")
         for t, w in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
             amount_usd = total_capital * w
-            total_allocated += amount_usd
-            
             latest_price = df[t].dropna().iloc[-1] if t in df.columns else 0
             shares_str = f" (約 <code>{amount_usd/latest_price:.1f} 股</code> @ ${latest_price:.2f})" if latest_price > 0 else ""
-            msg.append(f"• <b>{t}</b>: <code>{w*100:.1f}%</code> ➔ <b>${amount_usd:,.0f} USD</b>{shares_str}")
-            
-        unallocated_cash = total_capital - total_allocated
-        if unallocated_cash > 1:
-            msg.append(f"\n💵 <b>剩餘保留現金/國債(BIL)</b>: <code>${unallocated_cash:,.0f} USD</code> (<code>{(unallocated_cash/total_capital)*100:.1f}%</code>)")
+            msg.append(f"• <b>{t}</b>: <code>{w*100:.1f}%</code> ➔ <b>${amount_usd:,.2f} USD</b>{shares_str}")
             
         with open(state_file, "w") as f: json.dump(target_weights, f, indent=2)
     else:
