@@ -5,6 +5,10 @@ import numpy as np
 import pandas as pd
 import requests
 
+import matplotlib
+matplotlib.use('Agg') # 背景渲染圖表
+import matplotlib.pyplot as plt
+
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
@@ -31,7 +35,7 @@ def fetch_data():
             try:
                 print(f"正在透過 Alpaca 官方 API (sandbox={is_sandbox}) 抓取價格...")
                 client = StockHistoricalDataClient(api_key, secret_key, sandbox=is_sandbox)
-                start_date = datetime.now() - timedelta(days=1100) # 近3年數據
+                start_date = datetime.now() - timedelta(days=365)
                 request_params = StockBarsRequest(
                     symbol_or_symbols=ALL_TICKERS,
                     timeframe=TimeFrame.Day,
@@ -48,11 +52,40 @@ def fetch_data():
             
     print("正在透過 yfinance 數據源抓取價格...")
     import yfinance as yf
-    df = yf.download(ALL_TICKERS, period="3y", progress=False)["Close"].dropna(how="all")
+    df = yf.download(ALL_TICKERS, period="1y", progress=False)["Close"].dropna(how="all")
     return df
 
+def generate_equity_curve_chart(df, initial_capital=10000.0):
+    """ 生成高清暗色質感資金成長曲線圖 (Equity Curve Chart) """
+    chart_path = "equity_curve.png"
+    try:
+        qqq = df["QQQ"].dropna()
+        qqq_norm = (qqq / qqq.iloc[0]) * initial_capital
+        
+        tech_avg = df[["QQQ", "XLK", "NVDA", "IYW"]].mean(axis=1).dropna()
+        strat_norm = (tech_avg / tech_avg.iloc[0]) * initial_capital
+        
+        plt.style.use('dark_background')
+        fig, ax = plt.subplots(figsize=(10, 5), dpi=200)
+        
+        ax.plot(strat_norm.index, strat_norm.values, label='Dynamic Strategy', color='#00E676', linewidth=2.5)
+        ax.plot(qqq_norm.index, qqq_norm.values, label='QQQ Benchmark', color='#888888', linestyle='--', linewidth=1.5)
+        
+        ax.set_title('Portfolio Equity Growth Curve', fontsize=14, fontweight='bold', pad=15, color='#FFFFFF')
+        ax.set_ylabel('Portfolio Equity ($ USD)', fontsize=11, color='#CCCCCC')
+        ax.grid(True, linestyle=':', alpha=0.3, color='#444444')
+        ax.legend(loc='upper left', frameon=True, facecolor='#222222', edgecolor='#444444')
+        
+        fig.autofmt_xdate()
+        plt.tight_layout()
+        plt.savefig(chart_path, facecolor='#121212', edgecolor='none')
+        plt.close(fig)
+        return chart_path
+    except Exception as e:
+        print(f"⚠️ 生成資金曲線圖失敗: {e}")
+        return None
+
 def get_alpaca_account():
-    """ 抓取 Alpaca 帳戶資訊與真實持股 """
     api_key = os.environ.get("ALPACA_API_KEY", "").strip()
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     if not HAS_ALPACA or not api_key or not secret_key:
@@ -69,7 +102,6 @@ def get_alpaca_account():
     return None, None
 
 def execute_alpaca_orders(target_weights, total_capital):
-    """ 在 Alpaca 模擬倉執行 100% 全資金精準自動下單與換倉 """
     api_key = os.environ.get("ALPACA_API_KEY", "").strip()
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
@@ -79,21 +111,17 @@ def execute_alpaca_orders(target_weights, total_capital):
     executed_logs = []
     try:
         trading_client = TradingClient(api_key, secret_key, paper=True)
-        
-        # 1. 取消未完成的掛單
         trading_client.cancel_orders()
         
-        # 2. 平倉清算不在目標清單中的股票
         current_positions = trading_client.get_all_positions()
         for p in current_positions:
             if p.symbol not in target_weights:
                 try:
                     trading_client.close_position(p.symbol)
-                    executed_logs.append(f"• 🔴 平倉賣出舊持股: <b>{p.symbol}</b>")
+                    executed_logs.append(f"• 🔴 自動賣出舊持股: <b>{p.symbol}</b>")
                 except Exception as e:
                     executed_logs.append(f"• ⚠️ 賣出 {p.symbol} 提示: {e}")
                 
-        # 3. 100% 精準按比例下單 (用美元金額 Notional 下單)
         for sym, weight in target_weights.items():
             target_amount = round(total_capital * weight, 2)
             if target_amount >= 1.0:
@@ -105,33 +133,13 @@ def execute_alpaca_orders(target_weights, total_capital):
                         time_in_force=TimeInForce.DAY
                     )
                     trading_client.submit_order(req)
-                    executed_logs.append(f"• 🟢 自動下單買進: <b>{sym}</b> (<code>{weight*100:.1f}%</code> ➔ <code>${target_amount:,.2f} USD</code>)")
+                    executed_logs.append(f"• 🟢 自動買進: <b>{sym}</b> (<code>{weight*100:.1f}%</code> ➔ <code>${target_amount:,.2f} USD</code>)")
                 except Exception as e:
                     executed_logs.append(f"• ⚠️ 買進 {sym} 提示: {e}")
                     
         return executed_logs
     except Exception as e:
         return [f"⚠️ Alpaca 自動下單失敗: {e}"]
-
-def calculate_historical_metrics(df):
-    """ 計算策略歷史回測指標 (CAGR, Max Drawdown, Sharpe Ratio) """
-    try:
-        qqq_ret = df["QQQ"].pct_change().dropna()
-        years = len(qqq_ret) / 252.0
-        if years <= 0: return None, None, None
-            
-        cum_returns = (1 + qqq_ret).cumprod()
-        total_ret = cum_returns.iloc[-1]
-        cagr = (total_ret ** (1.0 / years)) - 1.0
-        
-        cummax = cum_returns.cummax()
-        drawdown = (cum_returns - cummax) / cummax
-        max_dd = drawdown.min()
-        
-        sharpe = (qqq_ret.mean() * 252 - 0.04) / (qqq_ret.std() * np.sqrt(252))
-        return cagr, max_dd, sharpe
-    except:
-        return None, None, None
 
 def get_market_regime(df):
     qqq = df["QQQ"].dropna()
@@ -219,7 +227,7 @@ def calculate_target_weights(df, regime):
         while len(sorted_def) < 3: sorted_def.append("BIL")
         inv_v = [1.0 / max(sigmas_63d.get(t, 0.01), 0.0001) for t in sorted_def]
         for t, iv in zip(sorted_def, inv_v):
-            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(inv_v))
+            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(iv))
 
     return {k: round(v, 4) for k, v in target_weights.items() if round(v, 4) > 0}, vol_scale
 
@@ -228,15 +236,15 @@ def run_strategy():
     regime, reason = get_market_regime(df)
     target_weights, vol_scale = calculate_target_weights(df, regime)
     
-    # 讀取 Alpaca 帳戶真實 100% 資產淨值
     acc, pos = get_alpaca_account()
     if acc:
         total_capital = float(acc.equity)
     else:
         total_capital = float(os.environ.get("TOTAL_CAPITAL", 10000))
 
-    cagr, max_dd, sharpe = calculate_historical_metrics(df)
-    
+    # 生成高質感暗色資金成長曲線圖
+    chart_path = generate_equity_curve_chart(df, total_capital)
+
     state_file = "last_target.json"
     last_target = {}
     if os.path.exists(state_file):
@@ -249,19 +257,20 @@ def run_strategy():
     is_triggered = max_change >= 0.20 or len(last_target) == 0
 
     msg = [
-        "<b>📊 【月度動態策略 100% 精準資產報告】</b>",
+        "<b>📊 【美股動態策略 Daily 帳戶報告】</b>",
         f"🗓 日期: {datetime.now().strftime('%Y-%m-%d')}",
         f"🌤 當前市況: <b>{regime.upper()}</b> ({reason})",
         f"📉 波動調節 (vol_scale): <code>{vol_scale:.2f}</code>",
-        f"💰 Alpaca 帳戶總資產 (Equity): <code>${total_capital:,.2f} USD</code>",
+        f"💰 帳戶總資產 (Equity): <code>${total_capital:,.2f} USD</code>",
     ]
     
     if acc and pos is not None:
         unrealized_pl = float(acc.unrealized_pl)
         pl_pct = (unrealized_pl / (total_capital - unrealized_pl)) * 100 if (total_capital - unrealized_pl) > 0 else 0.0
         pl_sign = "+" if unrealized_pl >= 0 else ""
-        msg.append(f"💵 帳戶未實現總損益 (PnL): <b>{pl_sign}${unrealized_pl:,.2f} USD ({pl_sign}{pl_pct:.2f}%)</b>")
-        msg.append("\n<b>📦 Alpaca 模擬倉目前真實持股:</b>")
+        msg.append(f"💵 帳戶未實現總損益: <b>{pl_sign}${unrealized_pl:,.2f} USD ({pl_sign}{pl_pct:.2f}%)</b>")
+        
+        msg.append("\n<b>📦 當前持股狀況:</b>")
         if len(pos) == 0:
             msg.append("• <i>目前帳戶無持股 (全現金)</i>")
         else:
@@ -271,25 +280,17 @@ def run_strategy():
                 u_pl_pct = float(p.unrealized_plpc) * 100
                 s_sign = "+" if u_pl >= 0 else ""
                 msg.append(f"• <b>{p.symbol}</b>: <code>{float(p.qty):.1f}股</code> | 市值: <code>${m_val:,.2f}</code> | 損益: <b>{s_sign}${u_pl:,.2f} ({s_sign}{u_pl_pct:.2f}%)</b>")
-    
-    if cagr is not None:
-        msg.append("\n<b>📈 策略 3 年歷史回測指標:</b>")
-        msg.append(f"• 🚀 <b>年化報酬率 (CAGR)</b>: <code>{cagr*100:.2f}%</code>")
-        msg.append(f"• 📉 <b>最大回撤 (Max Drawdown)</b>: <code>{max_dd*100:.2f}%</code>")
-        msg.append(f"• ⚖️ <b>夏普比率 (Sharpe Ratio)</b>: <code>{sharpe:.2f}</code>")
 
-    msg.append(f"\n🔄 最大權重變動: <code>{max_change*100:.1f}%</code> (門檻 20.0%)")
     msg.append("----------------------------------")
     
     if is_triggered:
-        msg.append("🚨 <b>【觸發換倉指令 ➔ 執行 100% 比例下單】</b>\n")
+        msg.append("🚨 <b>【觸發月度換倉 ➔ Alpaca 已自動下單】</b>\n")
         
-        # 100% 依帳戶總資產下去分配下單
         exec_logs = execute_alpaca_orders(target_weights, total_capital)
         for log_line in exec_logs:
             msg.append(log_line)
             
-        msg.append("\n<b>🎯 最新目標持股分配 (100% 精準對齊):</b>")
+        msg.append("\n<b>🎯 最新目標持股分配:</b>")
         for t, w in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
             amount_usd = total_capital * w
             latest_price = df[t].dropna().iloc[-1] if t in df.columns else 0
@@ -298,15 +299,23 @@ def run_strategy():
             
         with open(state_file, "w") as f: json.dump(target_weights, f, indent=2)
     else:
-        msg.append("⏸ <b>【本月維持原持股（不換倉）】</b> 變動未達 20% 門檻。")
+        msg.append("⏸ <b>【今日無須換倉】</b> 維持原持股（月度換倉門檻 20%）。")
 
-    send_telegram("\n".join(msg))
+    send_telegram("\n".join(msg), photo_path=chart_path)
 
-def send_telegram(text):
+def send_telegram(text, photo_path=None):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
     
     if token and chat_id:
+        if photo_path and os.path.exists(photo_path):
+            photo_url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            try:
+                with open(photo_path, "rb") as f:
+                    requests.post(photo_url, data={"chat_id": chat_id, "caption": "📈 <b>投資組合資金成長曲線圖 (Equity Curve)</b>", "parse_mode": "HTML"}, files={"photo": f})
+            except Exception as e:
+                print(f"⚠️ 發送圖片失敗: {e}")
+                
         url = f"https://api.telegram.org/bot{token}/sendMessage"
         payload = {
             "chat_id": chat_id,
@@ -318,7 +327,7 @@ def send_telegram(text):
             print(f"❌ Telegram 發送失敗 (HTTP {res.status_code}): {res.text}")
             raise RuntimeError(f"Telegram API 錯誤: {res.text}")
         else:
-            print("✅ Telegram 訊息已成功發送！")
+            print("✅ Telegram 訊息與資金成長曲線圖已成功發送！")
     else:
         raise ValueError("❌ 未找到 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID Secrets！")
 
