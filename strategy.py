@@ -5,10 +5,14 @@ import numpy as np
 import pandas as pd
 import requests
 
-from alpaca.data.historical import StockHistoricalDataClient
-from alpaca.data.requests import StockBarsRequest
-from alpaca.data.timeframe import TimeFrame
-from alpaca.data.enums import DataFeed
+try:
+    from alpaca.data.historical import StockHistoricalDataClient
+    from alpaca.data.requests import StockBarsRequest
+    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.enums import DataFeed
+    HAS_ALPACA = True
+except ImportError:
+    HAS_ALPACA = False
 
 # 1. 資產池定義
 TECH_POOL = ["FNGS", "QQQ", "IYW", "SMH", "TSM", "STX", "NVDA", "SOXX", "XLK", "VUG", "IWF", "PLTR", "WDC"]
@@ -19,7 +23,7 @@ def fetch_data():
     api_key = os.environ.get("ALPACA_API_KEY", "").strip()
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
-    if api_key and secret_key:
+    if HAS_ALPACA and api_key and secret_key:
         try:
             print("正在透過 Alpaca 官方 API (IEX 數據源) 抓取價格...")
             client = StockHistoricalDataClient(api_key, secret_key)
@@ -28,16 +32,16 @@ def fetch_data():
                 symbol_or_symbols=ALL_TICKERS,
                 timeframe=TimeFrame.Day,
                 start=start_date,
-                feed=DataFeed.IEX  # 專門支援 Alpaca 免費/模擬帳號數據源
+                feed=DataFeed.IEX
             )
             bars = client.get_stock_bars(request_params)
             close_df = bars.df["close"].unstack(level=0).dropna(how="all")
             if not close_df.empty:
                 return close_df
         except Exception as e:
-            print(f"⚠️ Alpaca API 抓取失敗: {e}\n正在自動切換至備用數據源...")
+            print(f"⚠️ Alpaca API 抓取失敗: {e}\n正在自動切換至 yfinance 數據源...")
             
-    print("正在透過備用數據源抓取價格...")
+    print("正在透過 yfinance 數據源抓取價格...")
     import yfinance as yf
     df = yf.download(ALL_TICKERS, period="2y", progress=False)["Close"].dropna(how="all")
     return df
@@ -154,45 +158,55 @@ def run_strategy():
     is_triggered = max_change >= 0.20 or len(last_target) == 0
 
     msg = [
-        "📊 **【月度動態策略訊號通知】**",
+        "<b>📊 【月度動態策略訊號通知】</b>",
         f"🗓 日期: {datetime.now().strftime('%Y-%m-%d')}",
-        f"🌤 當前市況: **{regime.upper()}** ({reason})",
-        f"📉 波動調節 (vol_scale): `{vol_scale:.2f}`",
-        f"💰 設定本金: `${total_capital:,.0f} USD`",
-        f"🔄 最大權重變動: `{max_change*100:.1f}%` (門檻 20.0%)",
+        f"🌤 當前市況: <b>{regime.upper()}</b> ({reason})",
+        f"📉 波動調節 (vol_scale): <code>{vol_scale:.2f}</code>",
+        f"💰 設定本金: <code>${total_capital:,.0f} USD</code>",
+        f"🔄 最大權重變動: <code>{max_change*100:.1f}%</code> (門檻 20.0%)",
         "----------------------------------"
     ]
     
     if is_triggered:
-        msg.append("🚨 **【觸發換倉指令】** 請按以下目標權重與金額執行：\n")
+        msg.append("🚨 <b>【觸發換倉指令】</b> 請按以下目標權重與金額執行：\n")
         total_allocated = 0.0
         for t, w in sorted(target_weights.items(), key=lambda x: x[1], reverse=True):
             amount_usd = total_capital * w
             total_allocated += amount_usd
             
             latest_price = df[t].dropna().iloc[-1] if t in df.columns else 0
-            shares_str = f" (約 `{amount_usd/latest_price:.1f} 股` @ ${latest_price:.2f})" if latest_price > 0 else ""
-            msg.append(f"• **{t}**: `{w*100:.1f}%` ➔ **${amount_usd:,.0f} USD**{shares_str}")
+            shares_str = f" (約 <code>{amount_usd/latest_price:.1f} 股</code> @ ${latest_price:.2f})" if latest_price > 0 else ""
+            msg.append(f"• <b>{t}</b>: <code>{w*100:.1f}%</code> ➔ <b>${amount_usd:,.0f} USD</b>{shares_str}")
             
         unallocated_cash = total_capital - total_allocated
         if unallocated_cash > 1:
-            msg.append(f"\n💵 **剩餘保留現金/國債(BIL)**: `${unallocated_cash:,.0f} USD` (`{(unallocated_cash/total_capital)*100:.1f}%`)")
+            msg.append(f"\n💵 <b>剩餘保留現金/國債(BIL)</b>: <code>${unallocated_cash:,.0f} USD</code> (<code>{(unallocated_cash/total_capital)*100:.1f}%</code>)")
             
         with open(state_file, "w") as f: json.dump(target_weights, f, indent=2)
     else:
-        msg.append("⏸ **【本月維持原持股（不換倉）】** 變動未達 20% 門檻。")
+        msg.append("⏸ <b>【本月維持原持股（不換倉）】</b> 變動未達 20% 門檻。")
 
     send_telegram("\n".join(msg))
 
 def send_telegram(text):
     token = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
     chat_id = os.environ.get("TELEGRAM_CHAT_ID", "").strip()
+    
     if token and chat_id:
-        res = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json={"chat_id": chat_id, "text": text, "parse_mode": "Markdown"})
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {
+            "chat_id": chat_id,
+            "text": text,
+            "parse_mode": "HTML"
+        }
+        res = requests.post(url, json=payload)
         if res.status_code != 200:
-            print(f"❌ Telegram 發送失敗: {res.text}")
+            print(f"❌ Telegram 發送失敗 (HTTP {res.status_code}): {res.text}")
+            raise RuntimeError(f"Telegram API 錯誤: {res.text}")
         else:
             print("✅ Telegram 訊息已成功發送！")
+    else:
+        raise ValueError("❌ 未找到 TELEGRAM_BOT_TOKEN 或 TELEGRAM_CHAT_ID Secrets！")
 
 if __name__ == "__main__":
     run_strategy()
