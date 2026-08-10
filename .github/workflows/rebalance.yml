@@ -1,0 +1,38 @@
+name: Monthly Strategy Rebalance Alert
+
+on:
+  schedule:
+    # 每月 1 號 UTC 12:00 (台灣時間晚上 8:00，開盤前自動跑)
+    - cron: '0 12 1 * *'
+  workflow_dispatch: # 支援在 GitHub 隨時手動點按鈕觸發測試
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 檢出程式碼
+        uses: actions/checkout@v4
+
+      - name: 設定 Python 環境
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: pip install alpaca-py pandas numpy requests
+
+      - name: 執行策略計算並發送 Telegram
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+          ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+          TOTAL_CAPITAL: ${{ secrets.TOTAL_CAPITAL }}
+        run: python strategy.py
+
+      - name: 自動儲存持股紀錄
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions@github.com"
+          git add last_target.json
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Update last_target.json" && git push)
