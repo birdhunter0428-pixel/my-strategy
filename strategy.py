@@ -5,10 +5,6 @@ import numpy as np
 import pandas as pd
 import requests
 
-import matplotlib
-matplotlib.use('Agg') # 背景渲染圖表
-import matplotlib.pyplot as plt
-
 try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.requests import StockBarsRequest
@@ -35,7 +31,7 @@ def fetch_data():
             try:
                 print(f"正在透過 Alpaca 官方 API (sandbox={is_sandbox}) 抓取價格...")
                 client = StockHistoricalDataClient(api_key, secret_key, sandbox=is_sandbox)
-                start_date = datetime.now() - timedelta(days=365)
+                start_date = datetime.now() - timedelta(days=500)
                 request_params = StockBarsRequest(
                     symbol_or_symbols=ALL_TICKERS,
                     timeframe=TimeFrame.Day,
@@ -52,13 +48,16 @@ def fetch_data():
             
     print("正在透過 yfinance 數據源抓取價格...")
     import yfinance as yf
-    df = yf.download(ALL_TICKERS, period="1y", progress=False)["Close"].dropna(how="all")
+    df = yf.download(ALL_TICKERS, period="2y", progress=False)["Close"].dropna(how="all")
     return df
 
 def generate_equity_curve_chart(df, initial_capital=10000.0):
-    """ 生成高清暗色質感資金成長曲線圖 (Equity Curve Chart) """
     chart_path = "equity_curve.png"
     try:
+        import matplotlib
+        matplotlib.use('Agg')
+        import matplotlib.pyplot as plt
+        
         qqq = df["QQQ"].dropna()
         qqq_norm = (qqq / qqq.iloc[0]) * initial_capital
         
@@ -101,7 +100,8 @@ def get_alpaca_account():
             pass
     return None, None
 
-def execute_alpaca_orders(target_weights, total_capital):
+def execute_alpaca_orders(target_weights, total_capital, df):
+    """ 24/7 全時段支援：使用股數 (qty) 與 GTC 模式自動掛單/買進 """
     api_key = os.environ.get("ALPACA_API_KEY", "").strip()
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
@@ -113,30 +113,48 @@ def execute_alpaca_orders(target_weights, total_capital):
         trading_client = TradingClient(api_key, secret_key, paper=True)
         trading_client.cancel_orders()
         
+        # 1. 賣出清倉不在目標內部的舊股票
         current_positions = trading_client.get_all_positions()
         for p in current_positions:
             if p.symbol not in target_weights:
                 try:
                     trading_client.close_position(p.symbol)
-                    executed_logs.append(f"• 🔴 自動賣出舊持股: <b>{p.symbol}</b>")
+                    executed_logs.append(f"• 🔴 自動賣出平倉: <b>{p.symbol}</b>")
                 except Exception as e:
                     executed_logs.append(f"• ⚠️ 賣出 {p.symbol} 提示: {e}")
                 
+        # 2. 按股數 (qty) + GTC 全時段掛單下買單 (解決閉盤時間金單拒絕問題)
         for sym, weight in target_weights.items():
-            target_amount = round(total_capital * weight, 2)
-            if target_amount >= 1.0:
+            target_amount = total_capital * weight
+            latest_price = df[sym].dropna().iloc[-1] if sym in df.columns else 0
+            if latest_price > 0 and target_amount >= 10.0:
+                shares = round(target_amount / latest_price, 2)
+                if shares <= 0: continue
+                
                 try:
                     req = MarketOrderRequest(
                         symbol=sym,
-                        notional=target_amount,
+                        qty=shares,
                         side=OrderSide.BUY,
-                        time_in_force=TimeInForce.DAY
+                        time_in_force=TimeInForce.GTC
                     )
                     trading_client.submit_order(req)
-                    executed_logs.append(f"• 🟢 自動買進: <b>{sym}</b> (<code>{weight*100:.1f}%</code> ➔ <code>${target_amount:,.2f} USD</code>)")
-                except Exception as e:
-                    executed_logs.append(f"• ⚠️ 買進 {sym} 提示: {e}")
-                    
+                    executed_logs.append(f"• 🟢 已成功下單買進: <b>{sym}</b> (<code>{shares} 股</code> @ ${latest_price:.2f})")
+                except Exception as e1:
+                    try:
+                        int_shares = int(target_amount // latest_price)
+                        if int_shares > 0:
+                            req = MarketOrderRequest(
+                                symbol=sym,
+                                qty=int_shares,
+                                side=OrderSide.BUY,
+                                time_in_force=TimeInForce.GTC
+                            )
+                            trading_client.submit_order(req)
+                            executed_logs.append(f"• 🟢 已成功下單買進: <b>{sym}</b> (<code>{int_shares} 股</code> @ ${latest_price:.2f})")
+                    except Exception as e2:
+                        executed_logs.append(f"• ⚠️ {sym} 下單失敗: {e2}")
+                        
         return executed_logs
     except Exception as e:
         return [f"⚠️ Alpaca 自動下單失敗: {e}"]
@@ -242,7 +260,6 @@ def run_strategy():
     else:
         total_capital = float(os.environ.get("TOTAL_CAPITAL", 10000))
 
-    # 生成高質感暗色資金成長曲線圖
     chart_path = generate_equity_curve_chart(df, total_capital)
 
     state_file = "last_target.json"
@@ -270,7 +287,7 @@ def run_strategy():
         pl_sign = "+" if unrealized_pl >= 0 else ""
         msg.append(f"💵 帳戶未實現總損益: <b>{pl_sign}${unrealized_pl:,.2f} USD ({pl_sign}{pl_pct:.2f}%)</b>")
         
-        msg.append("\n<b>📦 當前持股狀況:</b>")
+        msg.append("\n<b>📦 Alpaca 模擬倉當前持股:</b>")
         if len(pos) == 0:
             msg.append("• <i>目前帳戶無持股 (全現金)</i>")
         else:
@@ -284,9 +301,9 @@ def run_strategy():
     msg.append("----------------------------------")
     
     if is_triggered:
-        msg.append("🚨 <b>【觸發月度換倉 ➔ Alpaca 已自動下單】</b>\n")
+        msg.append("🚨 <b>【觸發換倉 ➔ Alpaca 全時段自動掛單買進】</b>\n")
         
-        exec_logs = execute_alpaca_orders(target_weights, total_capital)
+        exec_logs = execute_alpaca_orders(target_weights, total_capital, df)
         for log_line in exec_logs:
             msg.append(log_line)
             
