@@ -101,7 +101,6 @@ def get_alpaca_account():
     return None, None
 
 def execute_alpaca_orders(target_weights, total_capital, df):
-    """ 24/7 全時段支援：使用股數 (qty) 與 GTC 模式自動掛單/買進 """
     api_key = os.environ.get("ALPACA_API_KEY", "").strip()
     secret_key = os.environ.get("ALPACA_SECRET_KEY", "").strip()
     
@@ -123,7 +122,7 @@ def execute_alpaca_orders(target_weights, total_capital, df):
                 except Exception as e:
                     executed_logs.append(f"• ⚠️ 賣出 {p.symbol} 提示: {e}")
                 
-        # 2. 按股數 (qty) + GTC 全時段掛單下買單 (解決閉盤時間金單拒絕問題)
+        # 2. 按股數 (qty) + GTC 全時段掛單下買單
         for sym, weight in target_weights.items():
             target_amount = total_capital * weight
             latest_price = df[sym].dropna().iloc[-1] if sym in df.columns else 0
@@ -139,7 +138,7 @@ def execute_alpaca_orders(target_weights, total_capital, df):
                         time_in_force=TimeInForce.GTC
                     )
                     trading_client.submit_order(req)
-                    executed_logs.append(f"• 🟢 已成功下單買進: <b>{sym}</b> (<code>{shares} 股</code> @ ${latest_price:.2f})")
+                    executed_logs.append(f"• 🟢 已成功掛單買進: <b>{sym}</b> (<code>{shares} 股</code> @ ${latest_price:.2f})")
                 except Exception as e1:
                     try:
                         int_shares = int(target_amount // latest_price)
@@ -151,7 +150,7 @@ def execute_alpaca_orders(target_weights, total_capital, df):
                                 time_in_force=TimeInForce.GTC
                             )
                             trading_client.submit_order(req)
-                            executed_logs.append(f"• 🟢 已成功下單買進: <b>{sym}</b> (<code>{int_shares} 股</code> @ ${latest_price:.2f})")
+                            executed_logs.append(f"• 🟢 已成功掛單買進: <b>{sym}</b> (<code>{int_shares} 股</code> @ ${latest_price:.2f})")
                     except Exception as e2:
                         executed_logs.append(f"• ⚠️ {sym} 下單失敗: {e2}")
                         
@@ -245,7 +244,7 @@ def calculate_target_weights(df, regime):
         while len(sorted_def) < 3: sorted_def.append("BIL")
         inv_v = [1.0 / max(sigmas_63d.get(t, 0.01), 0.0001) for t in sorted_def]
         for t, iv in zip(sorted_def, inv_v):
-            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(iv))
+            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(inv_v))
 
     return {k: round(v, 4) for k, v in target_weights.items() if round(v, 4) > 0}, vol_scale
 
@@ -271,7 +270,10 @@ def run_strategy():
             
     all_t = set(list(target_weights.keys()) + list(last_target.keys()))
     max_change = max([abs(target_weights.get(t,0.0) - last_target.get(t,0.0)) for t in all_t]) if all_t else 1.0
-    is_triggered = max_change >= 0.20 or len(last_target) == 0
+    
+    # 💥【關鍵修復】：如果 Alpaca 帳戶持股數為 0，強制啟動首次下單！
+    alpaca_has_no_positions = (acc is not None and pos is not None and len(pos) == 0)
+    is_triggered = max_change >= 0.20 or len(last_target) == 0 or alpaca_has_no_positions
 
     msg = [
         "<b>📊 【美股動態策略 Daily 帳戶報告】</b>",
@@ -289,7 +291,7 @@ def run_strategy():
         
         msg.append("\n<b>📦 Alpaca 模擬倉當前持股:</b>")
         if len(pos) == 0:
-            msg.append("• <i>目前帳戶無持股 (全現金)</i>")
+            msg.append("• <i>目前帳戶無持股 (全現金) ➔ 正在自動下單建倉...</i>")
         else:
             for p in pos:
                 m_val = float(p.market_value)
@@ -301,7 +303,7 @@ def run_strategy():
     msg.append("----------------------------------")
     
     if is_triggered:
-        msg.append("🚨 <b>【觸發換倉 ➔ Alpaca 全時段自動掛單買進】</b>\n")
+        msg.append("🚨 <b>【觸發換倉/建倉 ➔ 執行 Alpaca 自動下單】</b>\n")
         
         exec_logs = execute_alpaca_orders(target_weights, total_capital, df)
         for log_line in exec_logs:
@@ -312,7 +314,7 @@ def run_strategy():
             amount_usd = total_capital * w
             latest_price = df[t].dropna().iloc[-1] if t in df.columns else 0
             shares_str = f" (約 <code>{amount_usd/latest_price:.1f} 股</code> @ ${latest_price:.2f})" if latest_price > 0 else ""
-            msg.append(f"• <b>{t}</b>: <code>{w*100:.1f}%</code> ➔ <b>${amount_usd:,.2f} USD</b>{shares_str}")
+            msg.append(f"• <b>{t}</b>: <code>{w*100:.1f}%</code> ➔ <b>${amount_usd:,.0f} USD</b>{shares_str}")
             
         with open(state_file, "w") as f: json.dump(target_weights, f, indent=2)
     else:
