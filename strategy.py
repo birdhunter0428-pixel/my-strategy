@@ -112,7 +112,6 @@ def execute_alpaca_orders(target_weights, total_capital, df):
         trading_client = TradingClient(api_key, secret_key, paper=True)
         trading_client.cancel_orders()
         
-        # 1. 賣出清倉不在目標內部的舊股票
         current_positions = trading_client.get_all_positions()
         for p in current_positions:
             if p.symbol not in target_weights:
@@ -122,7 +121,6 @@ def execute_alpaca_orders(target_weights, total_capital, df):
                 except Exception as e:
                     executed_logs.append(f"• ⚠️ 賣出 {p.symbol} 提示: {e}")
                 
-        # 2. 按股數 (qty) + GTC 全時段掛單下買單
         for sym, weight in target_weights.items():
             target_amount = total_capital * weight
             latest_price = df[sym].dropna().iloc[-1] if sym in df.columns else 0
@@ -244,7 +242,7 @@ def calculate_target_weights(df, regime):
         while len(sorted_def) < 3: sorted_def.append("BIL")
         inv_v = [1.0 / max(sigmas_63d.get(t, 0.01), 0.0001) for t in sorted_def]
         for t, iv in zip(sorted_def, inv_v):
-            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(inv_v))
+            target_weights[t] = target_weights.get(t, 0.0) + 1.0 * (iv / sum(iv))
 
     return {k: round(v, 4) for k, v in target_weights.items() if round(v, 4) > 0}, vol_scale
 
@@ -271,7 +269,7 @@ def run_strategy():
     all_t = set(list(target_weights.keys()) + list(last_target.keys()))
     max_change = max([abs(target_weights.get(t,0.0) - last_target.get(t,0.0)) for t in all_t]) if all_t else 1.0
     
-    # 💥【關鍵修復】：如果 Alpaca 帳戶持股數為 0，強制啟動首次下單！
+    # 💥【強制條件】：只要 Alpaca 帳戶持股數為 0，100% 強制啟動首次建倉！
     alpaca_has_no_positions = (acc is not None and pos is not None and len(pos) == 0)
     is_triggered = max_change >= 0.20 or len(last_target) == 0 or alpaca_has_no_positions
 
